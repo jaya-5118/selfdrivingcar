@@ -121,7 +121,7 @@ class SelfDrivingInferenceService:
         risk_score = float(1 - np.exp(-total_risk))
 
         summary = self._summarize_situation(class_ids, risk_score)
-        instruction = self._suggest_maneuver(risk_score, lateral_score_left, lateral_score_right, class_ids)
+        instruction = self._suggest_maneuver(risk_score, lateral_score_left, lateral_score_right, class_ids, boxes_xyxy, img_shape)
         return risk_score, risk_grid, summary, instruction
 
     def _summarize_situation(self, class_ids: np.ndarray, risk_score: float) -> str:
@@ -165,14 +165,12 @@ class SelfDrivingInferenceService:
         lateral_left: float,
         lateral_right: float,
         class_ids: np.ndarray,
+        boxes_xyxy: np.ndarray = None,
+        img_shape: Tuple[int, int, int] = None,
     ) -> str:
         """
-        Heuristic driving instruction based on global risk and lateral distribution:
-        - low risk: maintain speed and lane
-        - medium risk: gently slow down / be prepared
-        - high risk: brake or stop, possibly steer away from higher-risk side
+        Heuristic driving instruction based on global risk, lateral distribution, and gaps.
         """
-        # Map class ids to simple roles again for more nuanced text
         names = [self.class_names.get(int(cid), f"class_{cid}") for cid in class_ids]
         has_ped = any("person" in n.lower() or "pedestrian" in n.lower() for n in names)
         has_vehicle = any(
@@ -182,29 +180,71 @@ class SelfDrivingInferenceService:
 
         # Base instruction by risk level
         if risk_score < 0.25:
-            base = "Maintain current speed and lane."
+            base = "Maintain current speed. "
         elif risk_score < 0.6:
-            base = "Gently slow down and increase following distance."
+            base = "Gently slow down and check surroundings. "
         else:
-            base = "Brake smoothly and prepare to stop."
+            base = "URGENT: Brake smoothly and prepare to stop! "
 
-        # Lateral hint
+        # Distance and explicit explicit steering based on gaps
         steer = ""
-        diff = lateral_left - lateral_right
-        if abs(diff) > 0.25:
-            if diff > 0:
-                steer = " Traffic risk is higher on the left; keep slightly right within your lane."
+        if boxes_xyxy is not None and len(boxes_xyxy) > 0 and img_shape is not None:
+            h, w, _ = img_shape
+            center_x = w / 2.0
+            
+            # Sort boxes by left edge
+            boxes_sorted = sorted(boxes_xyxy, key=lambda b: b[0])
+            
+            largest_gap = 0
+            gap_center = center_x
+            
+            # Left edge to first box
+            prev_x = 0
+            gap = boxes_sorted[0][0] - prev_x
+            if gap > largest_gap:
+                largest_gap = gap
+                gap_center = gap / 2.0
+                
+            # Inter-object gaps
+            for b in boxes_sorted:
+                gap = b[0] - prev_x
+                if gap > largest_gap:
+                    largest_gap = gap
+                    gap_center = prev_x + gap / 2.0
+                prev_x = max(prev_x, b[2])
+                
+            # Last box to right edge
+            gap = w - prev_x
+            if gap > largest_gap:
+                largest_gap = gap
+                gap_center = prev_x + gap / 2.0
+                
+            # Distance approximation (max Y2 = lowest bounding box = closest object)
+            closest_y = max((b[3] for b in boxes_xyxy), default=0)
+            is_close = closest_y > h * 0.7
+            
+            # Decide direction
+            if abs(gap_center - center_x) < w * 0.15:
+                direction = "STRAIGHT AHEAD"
+            elif gap_center < center_x:
+                direction = "LEFT"
             else:
-                steer = " Traffic risk is higher on the right; keep slightly left within your lane."
+                direction = "RIGHT"
+                
+            steer = f"Best open path detected. Steer **{direction}**."
+            if is_close and risk_score > 0.3:
+                steer = f"Obstacle very close! Evasive action needed: Steer **{direction}** into the open space."
+        else:
+            steer = "Road is clear, steer STRAIGHT AHEAD."
 
         # Object-specific hint
         extra = ""
         if has_ped and risk_score >= 0.25:
-            extra = " Watch for pedestrians ahead and be ready to give way."
+            extra = " Watch for pedestrians."
         elif has_vehicle and risk_score >= 0.25:
-            extra = " Keep a safe gap to the vehicle in front."
+            extra = " Keep safe gap to vehicle in front."
         elif has_light and risk_score >= 0.25:
-            extra = " Check the traffic light state and be prepared to stop."
+            extra = " Check the traffic light state."
 
         return base + steer + extra
 
